@@ -1,68 +1,104 @@
-import { ApolloServer } from "apollo-server";
-import { LRUCache } from "lru-cache";
-import { v4 as uuid } from "uuid";
+import { ApolloServer } from "@apollo/server";
+import { expressMiddleware } from "@apollo/server/express4";
+import { ApolloServerPluginDrainHttpServer } from "@apollo/server/plugin/drainHttpServer";
+import express from "express";
+import { createServer } from "http";
+import { makeExecutableSchema } from "@graphql-tools/schema";
+import { WebSocketServer } from "ws";
+import { useServer } from "graphql-ws/lib/use/ws";
+import { PubSub } from "graphql-subscriptions";
+import bodyParser from "body-parser";
+import cors from "cors";
+
+const PORT = 4000;
+const pubsub = new PubSub();
+
+// A number that we'll increment over time to simulate subscription events
+let currentNumber = 0;
 
 // Schema definition
-const typeDefs = `
+const typeDefs = `#graphql
   type Query {
-    todos: [Todo]
-		todo(id: String!): Todo
+    currentNumber: Int
   }
 
-	type Todo {
-		id: String!
-		description: String!
-	}
-
-	type Mutation {
-		addTodo(description: String!): Todo
-		updateTodo(id: String!, description: String!): Todo
-	}
+  type Subscription {
+    numberIncremented: Int
+  }
 `;
 
-type Todo = {
-  id: string;
-  description: string;
-};
-
-// LRU cache for storing to-do items
-const cache = new LRUCache<Todo["id"], Todo["description"], unknown>({
-  max: 25,
-  ttl: 1000 * 60 * 5,
-});
-
-// Resolver definitions
+// Resolver map
 const resolvers = {
   Query: {
-    todos: () => {
-      const todos: Todo[] = [];
-      cache.forEach((description, id) => todos.push({ description, id }));
-      return todos;
-    },
-    todo: (_: unknown, { id }: Todo) => {
-      return { id, description: cache.get(id) };
+    currentNumber() {
+      return currentNumber;
     },
   },
-  Mutation: {
-    addTodo: (_: unknown, { description }: Todo) => {
-      const id = uuid();
-      const todo = { description, id };
-      cache.set(id, description);
-      return todo;
-    },
-    updateTodo: (_: unknown, { description, id }: Todo) => {
-      const todo = { description, id };
-      cache.set(id, description);
-      return todo;
+  Subscription: {
+    numberIncremented: {
+      subscribe: () => pubsub.asyncIterator(["NUMBER_INCREMENTED"]),
     },
   },
 };
 
+// Create schema, which will be used separately by ApolloServer and
+// the WebSocket server.
+const schema = makeExecutableSchema({ typeDefs, resolvers });
+
+// Create an Express app and HTTP server; we will attach the WebSocket
+// server and the ApolloServer to this HTTP server.
+const app = express();
+const httpServer = createServer(app);
+
+// Set up WebSocket server.
+const wsServer = new WebSocketServer({
+  server: httpServer,
+  path: "/graphql",
+});
+const serverCleanup = useServer({ schema }, wsServer);
+
+// Set up ApolloServer.
 const server = new ApolloServer({
-  typeDefs,
-  resolvers,
+  schema,
+  plugins: [
+    // Proper shutdown for the HTTP server.
+    ApolloServerPluginDrainHttpServer({ httpServer }),
+
+    // Proper shutdown for the WebSocket server.
+    {
+      async serverWillStart() {
+        return {
+          async drainServer() {
+            await serverCleanup.dispose();
+          },
+        };
+      },
+    },
+  ],
 });
 
-server.listen().then(({ url }) => {
-  console.log(`🚀 Server ready at ${url}`);
+await server.start();
+app.use(
+  "/graphql",
+  cors<cors.CorsRequest>(),
+  bodyParser.json(),
+  expressMiddleware(server),
+);
+
+// Now that our HTTP server is fully set up, actually listen.
+httpServer.listen(PORT, () => {
+  console.log(`🚀 Query endpoint ready at http://localhost:${PORT}/graphql`);
+  console.log(
+    `🚀 Subscription endpoint ready at ws://localhost:${PORT}/graphql`,
+  );
 });
+
+// In the background, increment a number every second and notify subscribers when it changes.
+function incrementNumber() {
+  currentNumber++;
+  pubsub.publish("NUMBER_INCREMENTED", { numberIncremented: currentNumber });
+  setTimeout(incrementNumber, 1000);
+}
+
+// Start incrementing
+incrementNumber();
